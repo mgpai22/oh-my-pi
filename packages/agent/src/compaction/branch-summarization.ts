@@ -84,6 +84,8 @@ export interface GenerateBranchSummaryOptions {
 	metadata?: Record<string, unknown>;
 	/** Convert app-specific messages before serializing the branch summary prompt. */
 	convertToLlm?: ConvertToLlm;
+	/** Rotate-on-rate-limit configuration forwarded to the branch-summary stream call. Absent ⇒ inert. */
+	rateLimitRotation?: SimpleStreamOptions["rateLimitRotation"];
 	/**
 	 * Optional telemetry handle. When provided, the branch summary LLM call is
 	 * wrapped in an OTEL chat span tagged with `pi.gen_ai.oneshot.kind = "branch_summary"`.
@@ -338,7 +340,7 @@ export async function generateBranchSummary(
 	const response = await instrumentedCompleteSimple(
 		model,
 		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
-		{ apiKey, signal, maxTokens: 2048, metadata },
+		{ apiKey, signal, maxTokens: 2048, metadata, rateLimitRotation: options.rateLimitRotation },
 		{ telemetry: options.telemetry, oneshotKind: "branch_summary", completeImpl: options.completeImpl },
 	);
 

@@ -93,7 +93,6 @@ import type {
 	Model,
 	ProviderResponseMetadata,
 	ProviderSessionState,
-	RateLimitRotationInfo,
 	RateLimitRotationOptions,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -186,6 +185,7 @@ import {
 } from "../config/model-resolver";
 import { MODEL_ROLE_IDS, MODEL_ROLES } from "../config/model-roles";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
+import { createRateLimitRotationOptions, rotationBlockedForMs } from "../config/rate-limit-rotation";
 import { buildServiceTierByFamily, serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
 import {
@@ -2561,6 +2561,7 @@ export class AgentSession {
 				providerSessionState: this.#providerSessionState,
 				preferWebsockets: this.#preferWebsockets,
 				getApiKey: requestModel => this.#modelRegistry.resolver(requestModel, advisorProviderSessionId),
+				rateLimitRotation: this.#rateLimitRotationOptions(advisorModel.provider, advisorProviderSessionId),
 				streamFn: this.#advisorStreamFn,
 				onPayload: this.#onPayload,
 				onResponse: this.#onResponse,
@@ -2941,6 +2942,7 @@ export class AgentSession {
 						sessionId: advisorProviderSessionId,
 						promptCacheKey: advisorProviderSessionId,
 						providerSessionState: this.#providerSessionState,
+						rateLimitRotation: this.#rateLimitRotationOptions(candidate.provider, advisorProviderSessionId),
 						codexCompaction,
 					},
 				);
@@ -6946,37 +6948,23 @@ export class AgentSession {
 	 */
 	#rateLimitRotationOptions(provider: string, sessionId: string | undefined): RateLimitRotationOptions | undefined {
 		const retry = this.settings.getGroup("retry");
-		if (!retry.rotateOnRateLimit) return undefined;
-		const authStorage = this.#modelRegistry.authStorage;
-		return {
-			enabled: true,
+		return createRateLimitRotationOptions({
+			enabled: retry.rotateOnRateLimit,
 			minSleepMs: retry.rotateMinSleepMs,
-			hasUsableSibling: () => authStorage.hasUsableSibling(provider, sessionId),
-			onRotate: info => this.#onCredentialRotated(info),
-		};
-	}
-
-	/** Surface a credential rotation as a session event + structured log line (plan §7). */
-	#onCredentialRotated(info: RateLimitRotationInfo): void {
-		// N1: the real block is sized privately inside rotateSessionCredential and
-		// never returns here. Recompute the same clamp from retryAfterMs purely for
-		// display; usage-limit blocks use a different (server-derived) window we do
-		// not know, so leave `blockedForMs` unset for them.
-		const blockedForMs =
-			info.reason === "rate_limit" ? Math.min(Math.max(info.retryAfterMs ?? 60_000, 5_000), 120_000) : undefined;
-		logger.info("credential rotated on rate limit", {
-			provider: info.provider,
-			reason: info.reason,
-			retryAfterMs: info.retryAfterMs,
-			attempt: info.attempt,
-			blockedForMs,
-		});
-		this.#emit({
-			type: "credential_rotated",
-			provider: info.provider,
-			reason: info.reason,
-			retryAfterMs: info.retryAfterMs,
-			blockedForMs,
+			authStorage: this.#modelRegistry.authStorage,
+			provider,
+			sessionId,
+			// The shared helper logs the rotation; this sink adds the session UI
+			// event (plan §7). Main/subagent turns built in sdk.ts get the log only,
+			// since the session event bus does not exist at Agent-construction time.
+			onRotate: info =>
+				this.#emit({
+					type: "credential_rotated",
+					provider: info.provider,
+					reason: info.reason,
+					retryAfterMs: info.retryAfterMs,
+					blockedForMs: rotationBlockedForMs(info),
+				}),
 		});
 	}
 
@@ -12174,6 +12162,7 @@ export class AgentSession {
 						sessionId: this.sessionId,
 						promptCacheKey: this.sessionId,
 						providerSessionState: this.#providerSessionState,
+						rateLimitRotation: this.#rateLimitRotationOptions(candidate.provider, this.sessionId),
 						// Route every summarization HTTP request through the
 						// session's side-stream transport so the provider
 						// concurrency cap (e.g. providers.ollama-cloud.maxConcurrency)
@@ -12881,6 +12870,7 @@ export class AgentSession {
 									sessionId: this.sessionId,
 									promptCacheKey: this.sessionId,
 									providerSessionState: this.#providerSessionState,
+									rateLimitRotation: this.#rateLimitRotationOptions(candidate.provider, this.sessionId),
 									codexCompaction,
 								},
 							);
@@ -15352,6 +15342,7 @@ export class AgentSession {
 				signal: this.#branchSummaryAbortController.signal,
 				customInstructions: this.#obfuscateTextForProvider(options.customInstructions),
 				reserveTokens: branchSummarySettings.reserveTokens,
+				rateLimitRotation: this.#rateLimitRotationOptions(model.provider, this.sessionId),
 				metadata: this.agent.metadataForProvider(model.provider),
 				convertToLlm: messages => this.#convertToLlmForSideRequest(messages),
 				telemetry: resolveTelemetry(this.agent.telemetry, this.sessionId),

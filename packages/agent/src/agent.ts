@@ -183,6 +183,11 @@ export interface AgentOptions {
 	 */
 	onSseEvent?: SimpleStreamOptions["onSseEvent"];
 	/**
+	 * Rotate-on-rate-limit configuration forwarded verbatim to each streamed
+	 * turn's {@link SimpleStreamOptions.rateLimitRotation}. Absent ⇒ inert.
+	 */
+	rateLimitRotation?: SimpleStreamOptions["rateLimitRotation"];
+	/**
 	 * Inspect assistant streaming events before they are emitted to subscribers.
 	 * Use this when abort decisions must happen before buffered events continue flowing.
 	 */
@@ -385,6 +390,7 @@ export class Agent {
 	#onPayload?: SimpleStreamOptions["onPayload"];
 	#onResponse?: SimpleStreamOptions["onResponse"];
 	#onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	#rateLimitRotation?: SimpleStreamOptions["rateLimitRotation"];
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
@@ -448,6 +454,7 @@ export class Agent {
 		this.#onPayload = opts.onPayload;
 		this.#onResponse = opts.onResponse;
 		this.#onSseEvent = opts.onSseEvent;
+		this.#rateLimitRotation = opts.rateLimitRotation;
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
@@ -1145,6 +1152,7 @@ export class Agent {
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
+			rateLimitRotation: this.#rateLimitRotation,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async context => {

@@ -45,6 +45,7 @@ import {
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
+import { createRateLimitRotationOptions } from "./config/rate-limit-rotation";
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { Settings, type SkillsSettings } from "./config/settings";
 import { CursorExecHandlers } from "./cursor";
@@ -2732,6 +2733,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			convertToLlm: convertToLlmFinal,
 			onPayload,
 			onResponse,
+			// Rotate-on-rate-limit for the main turn AND every subagent session
+			// (subagents construct through this same createAgentSession path).
+			// Provider is fixed to the session's initial model; the shared helper
+			// logs each rotation (the session credential_rotated UI event is added
+			// separately by AgentSession for the auxiliary streams it owns).
+			rateLimitRotation: model
+				? createRateLimitRotationOptions({
+						enabled: settings.getGroup("retry").rotateOnRateLimit,
+						minSleepMs: settings.getGroup("retry").rotateMinSleepMs,
+						authStorage: modelRegistry.authStorage,
+						provider: model.provider,
+						sessionId: providerSessionId,
+					})
+				: undefined,
 			sessionId: providerSessionId,
 			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,

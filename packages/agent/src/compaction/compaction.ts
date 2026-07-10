@@ -750,6 +750,11 @@ export interface SummaryOptions {
 	/** Optional fetch implementation threaded into remote compaction calls. */
 	fetch?: FetchImpl;
 	/**
+	 * Rotate-on-rate-limit configuration forwarded to each local summarization
+	 * oneshot's {@link SimpleStreamOptions.rateLimitRotation}. Absent ⇒ inert.
+	 */
+	rateLimitRotation?: SimpleStreamOptions["rateLimitRotation"];
+	/**
 	 * Optional completion transport override for host-level request wrappers
 	 * (e.g. the coding-agent provider-concurrency limiter). When provided,
 	 * every local summarization oneshot (`generateSummary`,
@@ -864,6 +869,7 @@ export async function generateSummary(
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
 			providerSessionState: options?.providerSessionState,
+			rateLimitRotation: options?.rateLimitRotation,
 			codexCompaction: localCodexCompaction(options),
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_summary", completeImpl: options?.completeImpl },
@@ -1072,6 +1078,7 @@ async function generateShortSummary(
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
 			providerSessionState: options?.providerSessionState,
+			rateLimitRotation: options?.rateLimitRotation,
 			codexCompaction: localCodexCompaction(options),
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_short_summary", completeImpl: options?.completeImpl },
@@ -1347,6 +1354,7 @@ export async function compact(
 		codexCompaction: options?.codexCompaction,
 		tools: options?.tools,
 		fetch: options?.fetch,
+		rateLimitRotation: options?.rateLimitRotation,
 		completeImpl: options?.completeImpl,
 	};
 
@@ -1602,6 +1610,7 @@ async function generateTurnPrefixSummary(
 			sessionId: options?.sessionId,
 			promptCacheKey: options?.promptCacheKey,
 			providerSessionState: options?.providerSessionState,
+			rateLimitRotation: options?.rateLimitRotation,
 			codexCompaction: localCodexCompaction(options),
 		},
 		{ telemetry: options?.telemetry, oneshotKind: "compaction_turn_prefix", completeImpl: options?.completeImpl },
