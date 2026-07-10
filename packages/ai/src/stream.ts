@@ -20,7 +20,13 @@ import { getCustomApi } from "./api-registry";
 import { AUTH_RETRY_STEPS, isApiKeyResolver, resolveRetryKey } from "./auth-retry";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
-import { isUsageLimitOutcome } from "./error/rate-limit";
+import { isUsageLimit } from "./error/flags";
+import {
+	isRotatableRateLimit,
+	isRotatableRateLimitOutcome,
+	isUsageLimitOutcome,
+	RateLimitRotationRequested,
+} from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { CursorOptions } from "./providers/cursor";
@@ -76,6 +82,7 @@ import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
 import { wrapFetchForProxy } from "./utils/proxy";
+import { parseRetryAfterMsHint } from "./utils/rate-limit-rotation";
 import { withRequestDebugFetch } from "./utils/request-debug";
 import { withGeminiThinkingLoopGuard } from "./utils/thinking-loop";
 
@@ -966,7 +973,12 @@ function extractStatusFromAssistantError(message: AssistantMessage): number | un
 	return AIError.status({ message: message.errorMessage });
 }
 
-function isRetryableUpstreamError(error: unknown, status: number | undefined, message: string | undefined): boolean {
+function isRetryableUpstreamError(
+	error: unknown,
+	status: number | undefined,
+	message: string | undefined,
+	rotateOnRateLimit: boolean,
+): boolean {
 	// 401 means the credential is bad. Usage-limit phrasing (Codex's
 	// "You have hit your ChatGPT usage limit", Anthropic's "usage_limit_reached",
 	// Google's "resource_exhausted", OpenAI's "insufficient_quota") and 429s
@@ -977,10 +989,15 @@ function isRetryableUpstreamError(error: unknown, status: number | undefined, me
 	// `markUsageLimitReached`. Transient 429s ("Too many requests",
 	// per-minute caps) classify as RATE_LIMIT_EXCEEDED in
 	// `parseRateLimitReason` and stay in the provider's own backoff layer
-	// instead of burning siblings.
+	// instead of burning siblings — UNLESS `rotateOnRateLimit` is enabled, in
+	// which case a rotatable RPM 429 (surfaced early by Prong B, or a direct
+	// terminal 429) is admitted so the a/b/c loop can rotate to a sibling.
 	if (status === 401) return true;
-	void error;
-	return isUsageLimitOutcome(status, message);
+	if (isUsageLimitOutcome(status, message)) return true;
+	if (!rotateOnRateLimit) return false;
+	// Prong B surfaces as an EVENT (status+message), matched here; the marker
+	// instance only appears on the thrown-exception seam and is defensive (N5).
+	return isRotatableRateLimitOutcome(status, message) || error instanceof RateLimitRotationRequested;
 }
 
 function createAssistantAuthError(message: AssistantMessage): Error {
@@ -1012,6 +1029,12 @@ export function streamSimple<TApi extends Api>(
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;
+		// Capability-gated (R4): rotation only makes sense when the host enabled it
+		// AND supplied a sibling-availability check. When either is missing the
+		// classifier stays byte-identical (rotatable rate limits are NOT admitted),
+		// so a non-AuthStorage resolver or a disabled flag leaves behavior unchanged.
+		const rotation = requestOptions.rateLimitRotation;
+		const rotateOnRateLimit = rotation?.enabled === true && rotation.hasUsableSibling !== undefined;
 		// One inner attempt against a resolved string key. When
 		// `captureAuthFailure` is set, a retryable auth error that arrives before
 		// any replay-unsafe event is buffered and returned (so the caller can
@@ -1040,6 +1063,7 @@ export function streamSimple<TApi extends Api>(
 							event.error,
 							extractStatusFromAssistantError(event.error),
 							event.error.errorMessage,
+							rotateOnRateLimit,
 						)
 					) {
 						return { error: createAssistantAuthError(event.error), bufferedEvents, terminalEvent: event };
@@ -1059,6 +1083,7 @@ export function streamSimple<TApi extends Api>(
 						error,
 						AIError.status(error),
 						error instanceof Error ? error.message : undefined,
+						rotateOnRateLimit,
 					)
 				) {
 					return { error, bufferedEvents };
@@ -1115,6 +1140,21 @@ export function streamSimple<TApi extends Api>(
 				);
 				if (nextKey === undefined || nextKey === lastKey) continue;
 				lastKey = nextKey;
+				// Telemetry: a key change with a classified reason IS a credential
+				// rotation (rate-limit or usage-limit). Gate on the reason so plain
+				// refresh-same-key steps — which also change the key — never fire it.
+				if (rotation?.onRotate) {
+					const rotatedForRateLimit = isRotatableRateLimit(failure.error);
+					if (rotatedForRateLimit || isUsageLimit(failure.error)) {
+						const failureMessage = failure.error instanceof Error ? failure.error.message : undefined;
+						rotation.onRotate({
+							provider: model.provider,
+							reason: rotatedForRateLimit ? "rate_limit" : "usage_limit",
+							retryAfterMs: parseRetryAfterMsHint(failureMessage),
+							attempt: step,
+						});
+					}
+				}
 				const isLastStep = step === AUTH_RETRY_STEPS.length - 1;
 				const next = await runAttempt(nextKey, !isLastStep);
 				if (!next) return;
@@ -1442,6 +1482,8 @@ function mapOptionsForApi<TApi extends Api>(
 		execHandlers: options?.execHandlers,
 		fetch: options?.fetch,
 		fallbacks: options?.fallbacks,
+		providerRetryWait: options?.providerRetryWait,
+		rateLimitRotation: options?.rateLimitRotation,
 	};
 
 	switch (model.api) {

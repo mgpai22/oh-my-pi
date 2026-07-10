@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { getAgentDbPath, logger } from "@oh-my-pi/pi-utils";
 import type { ApiKeyResolver } from "./auth-retry";
 import * as AIError from "./error";
-import { isUsageLimitOutcome } from "./error/rate-limit";
+import { isRotatableRateLimitOutcome, isUsageLimitOutcome } from "./error/rate-limit";
 import { getProviderDefinition, PASTE_CODE_LOGIN_PROVIDERS } from "./registry";
 import { getOAuthApiKey, getOAuthProvider, refreshOAuthToken } from "./registry/oauth";
 import type {
@@ -56,6 +56,7 @@ import {
 } from "./usage/openai-codex-reset";
 import { opencodeGoUsageProvider } from "./usage/opencode-go";
 import { zaiUsageProvider } from "./usage/zai";
+import { parseRetryAfterMsHint } from "./utils/rate-limit-rotation";
 
 const USAGE_RANKING_METRIC_EPSILON = 1e-9;
 
@@ -4637,6 +4638,36 @@ export class AuthStorage {
 	 *
 	 * Returns whether another usable credential of the same type remains.
 	 */
+	/**
+	 * Whether a usable (unblocked, same-type) sibling of the given session
+	 * credential exists right now. Computed against the live credential array and
+	 * the unscoped block map, so callers must snapshot it BEFORE any mutation that
+	 * could reindex credentials. Shared by {@link rotateSessionCredential} and the
+	 * public {@link hasUsableSibling}.
+	 */
+	#hasUsableSibling(provider: string, sessionCredential: { type: AuthCredential["type"]; index: number }): boolean {
+		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+		return this.#getCredentialsForProvider(provider).some(
+			(credential, index) =>
+				credential.type === sessionCredential.type &&
+				index !== sessionCredential.index &&
+				!this.#isCredentialBlocked(provider, providerKey, index),
+		);
+	}
+
+	/**
+	 * Public capability check for the rotate-on-rate-limit hook context: does the
+	 * session's current credential have a usable sibling to fail over to? Returns
+	 * false when the session has no recorded credential (nothing to rotate from) —
+	 * which also keeps the feature inert for non-AuthStorage resolvers that never
+	 * recorded one.
+	 */
+	hasUsableSibling(provider: string, sessionId: string | undefined): boolean {
+		const sessionCredential = this.#getSessionCredential(provider, sessionId);
+		if (!sessionCredential) return false;
+		return this.#hasUsableSibling(provider, sessionCredential);
+	}
+
 	async rotateSessionCredential(
 		provider: string,
 		sessionId: string | undefined,
@@ -4658,15 +4689,28 @@ export class AuthStorage {
 			).switched;
 		}
 
+		// Transient RPM 429 (RATE_LIMIT_EXCEEDED only): give the hot credential a
+		// SHORT unscoped block so `#getCredentialOrder` re-ranks around it until the
+		// per-minute window rolls, then report the sibling for immediate rotation.
+		// Deliberately NOT `markUsageLimitReached` — that derives a block scope
+		// (scoped blocks are invisible to selection, P0-2) and can override with an
+		// hours-long OAuth resetAtMs (P1-3). The block is UNSCOPED so
+		// `#selectCredentialByType` (checks unscoped) skips it, and the session
+		// sticky is left INTACT (blocking + re-ranking does the rotation, matching
+		// the usage-limit branch). No usable sibling ⇒ no block, no rotation (G3).
+		if (isRotatableRateLimitOutcome(status, message)) {
+			if (!this.#hasUsableSibling(provider, sessionCredential)) return false;
+			const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+			const retryAfterMs = parseRetryAfterMsHint(message);
+			const blockMs = Math.min(Math.max(retryAfterMs ?? AuthStorage.#defaultBackoffMs, 5_000), 120_000);
+			this.#markCredentialBlocked(provider, providerKey, sessionCredential.index, Date.now() + blockMs);
+			return true;
+		}
+
 		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
 		// Snapshot sibling availability before mutating so a soft-deleting
 		// suspect hook can't reindex the answer out from under us.
-		const hasSibling = this.#getCredentialsForProvider(provider).some(
-			(credential, index) =>
-				credential.type === sessionCredential.type &&
-				index !== sessionCredential.index &&
-				!this.#isCredentialBlocked(provider, providerKey, index),
-		);
+		const hasSibling = this.#hasUsableSibling(provider, sessionCredential);
 		const target = this.#getStoredCredentials(provider)[sessionCredential.index];
 		this.#clearSessionCredential(provider, sessionId);
 		this.#markCredentialBlocked(

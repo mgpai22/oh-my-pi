@@ -2,6 +2,7 @@ import type { OAuthAccess } from "./auth-storage";
 import * as AIError from "./error";
 import { isAuthRetryableError } from "./error/auth-classify";
 import { isUsageLimit } from "./error/flags";
+import { isRotatableRateLimit } from "./error/rate-limit";
 
 /**
  * Context passed to an {@link ApiKeyResolver} on each resolution attempt.
@@ -93,7 +94,10 @@ export async function resolveRetryKey(
 	previousKey?: string,
 ): Promise<string | undefined> {
 	try {
-		const rotateSibling = lastChance || (!lastChance && isUsageLimit(error));
+		// Rotatable RPM 429s skip refresh-same (step b): a token re-mint cannot
+		// clear a per-minute window, so switch to a sibling immediately — same as
+		// usage-limit errors already do.
+		const rotateSibling = lastChance || isUsageLimit(error) || isRotatableRateLimit(error);
 		return (await resolver({ lastChance: rotateSibling, error, signal, previousKey })) || undefined;
 	} catch {
 		return undefined;
