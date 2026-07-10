@@ -21,6 +21,7 @@
 
 - Fixed concurrent reasoning summaries to ignore legacy streaming events under cutoff contract
 - Normalized arbitrary Codex session IDs to stable version-7-shaped transport UUIDs, preventing GPT-5.6 Luna requests from routing to stale deployments.
+- Fixed sequential-cutoff Codex reasoning summaries repeating earlier content when atomic summary snapshots are replayed or extended.
 
 ## [16.3.15] - 2026-07-09
 
