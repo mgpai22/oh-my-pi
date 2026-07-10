@@ -14,14 +14,15 @@
  *   captured response body for the strict-tools fallback and the responses
  *   chain-state detectors, which regex over `error.message`.
  */
-import { fetchWithRetry, readSseJson, type SseEventObserver } from "@oh-my-pi/pi-utils";
+import { extractRetryHint, fetchWithRetry, readSseJson, type SseEventObserver } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { OpenAIHttpError } from "../error";
 
 export { OpenAIHttpError };
 
-import type { FetchImpl } from "../types";
+import type { FetchImpl, RateLimitRotationOptions } from "../types";
 import type { CapturedHttpErrorResponse } from "./http-inspector";
+import { makeRotationAwareOnBeforeSleep } from "./rate-limit-rotation";
 
 /**
  * Total attempts (initial + retries). Parity with the removed SDK clients'
@@ -44,6 +45,15 @@ export interface OpenAIStreamRequestInit {
 	fetch?: FetchImpl;
 	/** Raw wire-frame observer (`onSseEvent` debug pipeline). */
 	onSseEvent?: SseEventObserver;
+	/** Provider slug, for rotation stall logging. */
+	provider?: string;
+	/**
+	 * Rotate-on-rate-limit config. When enabled with a usable sibling, a transient
+	 * 429 is surfaced early (instead of slept off in `fetchWithRetry`) and the
+	 * raised {@link OpenAIHttpError} carries a `retry-after-ms:` hint so the a/b/c
+	 * seam rotates to a sibling credential.
+	 */
+	rateLimitRotation?: RateLimitRotationOptions;
 }
 
 export interface OpenAIStreamHandle<TEvent> {
@@ -62,6 +72,7 @@ export interface OpenAIStreamHandle<TEvent> {
  * watchdog timers and abort-reason bookkeeping.
  */
 export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): Promise<OpenAIStreamHandle<TEvent>> {
+	const rotation = init.rateLimitRotation;
 	const response = await fetchWithRetry(init.url, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...init.headers },
@@ -73,9 +84,15 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 		// Cold large-context streams legitimately exceed it; the caller's
 		// `firstEventTimeoutMs`/`AbortSignal` already govern stuck requests.
 		timeout: false,
+		onBeforeSleep: rotation
+			? makeRotationAwareOnBeforeSleep({ provider: init.provider ?? "openai", rotation })
+			: undefined,
 	});
 	if (!response.ok) {
-		throw await captureOpenAIHttpError(response);
+		// On a surfaced/exhausted 429 with rotation active, embed the server's
+		// Retry-After so the auth-storage rotation branch can size a short block.
+		const retryAfterMsHint = rotation?.enabled && response.status === 429 ? extractRetryHint(response) : undefined;
+		throw await captureOpenAIHttpError(response, retryAfterMsHint);
 	}
 	if (!response.body) {
 		throw new AIError.ProviderResponseError(`OpenAI stream response has no body (status ${response.status})`, {
@@ -89,8 +106,18 @@ export async function postOpenAIStream<TEvent>(init: OpenAIStreamRequestInit): P
 	};
 }
 
-/** Decode a non-2xx response into an {@link OpenAIHttpError} without consuming it twice. */
-export async function captureOpenAIHttpError(response: Response): Promise<AIError.OpenAIHttpError> {
+/**
+ * Decode a non-2xx response into an {@link OpenAIHttpError} without consuming it
+ * twice. When `retryAfterMsHint` is supplied AND the response carried an
+ * informative body, the hint is appended to the message as `; retry-after-ms:
+ * <N>`. Opaque bodies ("<status> status code (no body)") are left untouched so
+ * they keep classifying as a usage-limit outcome (plan R5) rather than being
+ * pushed into an UNKNOWN reason.
+ */
+export async function captureOpenAIHttpError(
+	response: Response,
+	retryAfterMsHint?: number,
+): Promise<AIError.OpenAIHttpError> {
 	let bodyText: string | undefined;
 	let bodyJson: unknown;
 	try {
@@ -112,8 +139,12 @@ export async function captureOpenAIHttpError(response: Response): Promise<AIErro
 	const { detail, code } = OpenAIHttpError.parseEnvelope(bodyJson, bodyText);
 	// "status code (no body)" matches the SDK's former APIError phrasing;
 	// `finalizeErrorMessage` keys a repair path on that exact wording.
+	const hintSuffix =
+		detail && retryAfterMsHint !== undefined && !/retry-after-ms:/i.test(detail)
+			? `; retry-after-ms: ${retryAfterMsHint}`
+			: "";
 	const message = detail
-		? `${response.status} ${detail.length > MAX_DETAIL_CHARS ? detail.slice(0, MAX_DETAIL_CHARS) : detail}`
+		? `${response.status} ${detail.length > MAX_DETAIL_CHARS ? detail.slice(0, MAX_DETAIL_CHARS) : detail}${hintSuffix}`
 		: `${response.status} status code (no body)`;
 	return new AIError.OpenAIHttpError(message, captured, code);
 }

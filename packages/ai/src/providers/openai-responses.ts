@@ -487,6 +487,8 @@ const streamOpenAIResponsesOnce = (
 								body: requestParams,
 								signal: requestSignal,
 								fetch: options?.fetch,
+								provider: model.provider,
+								rateLimitRotation: options?.rateLimitRotation,
 								// Transient 408/429/5xx get Retry-After-aware transport
 								// retries; the first-event watchdog aborts `requestSignal`,
 								// so retries cannot extend the caller's deadline.

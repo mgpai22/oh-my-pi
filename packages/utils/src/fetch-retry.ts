@@ -154,6 +154,20 @@ export interface FetchWithRetryOptions extends RequestInit {
 	 */
 	shouldRetryResponse?: (response: Response, bodyText: string, attempt: number) => boolean | Promise<boolean>;
 	/**
+	 * Optional decision hook consulted after a retryable response is committed to
+	 * (past the over-cap early-return) but before the backoff sleep. Returning
+	 * `"surface"` returns the current `!ok` response immediately — the same shape
+	 * as the over-cap path — so a caller can rotate credentials instead of sleeping
+	 * off a transient 429. Returning `"sleep"` (the default when absent) preserves
+	 * the normal backoff.
+	 */
+	onBeforeSleep?: (info: {
+		attempt: number;
+		delayMs: number;
+		status: number;
+		retryAfterMs?: number;
+	}) => "sleep" | "surface";
+	/**
 	 * Bun extension forwarded verbatim to the underlying `fetch` call. `false`
 	 * disables Bun's native ~300s pre-response timeout (callers that own a
 	 * configurable first-event/idle watchdog or an external `AbortSignal`
@@ -185,6 +199,7 @@ export async function fetchWithRetry(
 		defaultDelayMs,
 		prepareInit,
 		shouldRetryResponse,
+		onBeforeSleep,
 		fetch: fetchImpl = fetch,
 		timeout = false,
 		...baseInit
@@ -228,6 +243,9 @@ export async function fetchWithRetry(
 		if (hint !== undefined && hint > maxDelayMs) return response;
 
 		const delayMs = Math.min(hint ?? resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), maxDelayMs);
+		if (onBeforeSleep?.({ attempt, delayMs, status: response.status, retryAfterMs: hint }) === "surface") {
+			return response;
+		}
 		await scheduler.wait(delayMs, { signal });
 	}
 }

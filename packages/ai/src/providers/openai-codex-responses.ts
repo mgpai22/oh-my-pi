@@ -11,6 +11,7 @@ import {
 	$env,
 	$flag,
 	asRecord,
+	extractRetryHint,
 	fetchWithRetry,
 	getInstallId,
 	logger,
@@ -31,6 +32,7 @@ import type {
 	FetchImpl,
 	Model,
 	ProviderSessionState,
+	RateLimitRotationOptions,
 	RawSseEvent,
 	ServiceTier,
 	StreamFunction,
@@ -59,6 +61,7 @@ import {
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
+import { makeRotationAwareOnBeforeSleep } from "../utils/rate-limit-rotation";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { adaptSchemaForStrict, NO_STRICT, sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { notifyRawSseEvent } from "../utils/sse-debug";
@@ -1532,6 +1535,7 @@ async function openCodexSseTransport(
 				requestSetup.firstEventTimeoutMs,
 				event => options?.onSseEvent?.(event, model),
 				options?.fetch,
+				options?.rateLimitRotation,
 			),
 		);
 	};
@@ -3690,6 +3694,7 @@ async function openCodexSseEventStream(
 	firstEventTimeoutMs: number | undefined,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
+	rateLimitRotation?: RateLimitRotationOptions,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const headers = createCodexHeaders(
 		requestHeaders,
@@ -3728,6 +3733,9 @@ async function openCodexSseEventStream(
 			maxDelayMs: CODEX_RATE_LIMIT_BUDGET_MS,
 			fetch: fetchOverride,
 			timeout: false,
+			onBeforeSleep: rateLimitRotation
+				? makeRotationAwareOnBeforeSleep({ provider: "openai-codex", rotation: rateLimitRotation })
+				: undefined,
 		});
 	} finally {
 		watchdog.clear();
@@ -3741,7 +3749,26 @@ async function openCodexSseEventStream(
 			cfRay: response.headers.get("cf-ray") || null,
 		});
 	if (!response.ok) {
-		throw await CodexApiError.fromResponse(response);
+		const error = await CodexApiError.fromResponse(response);
+		// Embed the server Retry-After on a surfaced/exhausted 429 so the a/b/c
+		// seam's rotation branch can size a short block (headers survive the body
+		// read `fromResponse` already did). Opaque/no-hint 429s are left as-is.
+		if (rateLimitRotation?.enabled && response.status === 429) {
+			const hint = extractRetryHint(response);
+			if (hint !== undefined) {
+				const suffix = `; retry-after-ms: ${hint}`;
+				const withHint = (value: string): string => (/retry-after-ms:/i.test(value) ? value : `${value}${suffix}`);
+				throw new CodexApiError(
+					{
+						...error.info,
+						message: withHint(error.info.message),
+						friendlyMessage: error.info.friendlyMessage ? withHint(error.info.friendlyMessage) : undefined,
+					},
+					response.headers,
+				);
+			}
+		}
+		throw error;
 	}
 	updateCodexSessionMetadataFromHeaders(state, response.headers);
 	if (!response.body) {

@@ -78,4 +78,63 @@ describe("fetchWithRetry", () => {
 		expect(await response.text()).toBe("slow down");
 		expect(attempt).toBe(1);
 	});
+
+	it("surfaces the !ok response before sleeping when onBeforeSleep returns 'surface'", async () => {
+		let attempt = 0;
+		const seen: Array<{ attempt: number; delayMs: number; status: number; retryAfterMs?: number }> = [];
+		const customFetch = async () => {
+			attempt += 1;
+			return new Response("slow down", { status: 429, headers: { "retry-after-ms": "5000" } });
+		};
+
+		const response = await fetchWithRetry("https://example.invalid/surface", {
+			fetch: customFetch,
+			defaultDelayMs: 1,
+			maxAttempts: 5,
+			onBeforeSleep: info => {
+				seen.push(info);
+				return "surface";
+			},
+		});
+
+		// One attempt, then surfaced instead of slept — the caller gets the 429 back.
+		expect(response.status).toBe(429);
+		expect(attempt).toBe(1);
+		expect(seen).toEqual([{ attempt: 0, delayMs: 5000, status: 429, retryAfterMs: 5000 }]);
+	});
+
+	it("preserves normal retry/backoff when onBeforeSleep returns 'sleep'", async () => {
+		let attempt = 0;
+		const customFetch = async () => {
+			attempt += 1;
+			return attempt < 2 ? new Response("", { status: 429 }) : new Response("done", { status: 200 });
+		};
+
+		const response = await fetchWithRetry("https://example.invalid/sleep", {
+			fetch: customFetch,
+			defaultDelayMs: 1,
+			maxAttempts: 3,
+			onBeforeSleep: () => "sleep",
+		});
+
+		expect(response.status).toBe(200);
+		expect(attempt).toBe(2);
+	});
+
+	it("is byte-identical to baseline when onBeforeSleep is absent", async () => {
+		let attempt = 0;
+		const customFetch = async () => {
+			attempt += 1;
+			return attempt < 3 ? new Response("", { status: 429 }) : new Response("done", { status: 200 });
+		};
+
+		const response = await fetchWithRetry("https://example.invalid/absent", {
+			fetch: customFetch,
+			defaultDelayMs: 1,
+			maxAttempts: 5,
+		});
+
+		expect(response.status).toBe(200);
+		expect(attempt).toBe(3);
+	});
 });
