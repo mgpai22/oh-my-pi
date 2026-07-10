@@ -188,6 +188,9 @@ export class EventController {
 				this.ctx.ui.resetDisplay();
 			},
 			goal_updated: async () => {},
+			// Credential rotation is informational (already logged + surfaced to
+			// external subscribers); no interactive-TUI treatment needed.
+			credential_rotated: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 

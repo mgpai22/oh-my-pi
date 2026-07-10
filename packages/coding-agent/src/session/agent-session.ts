@@ -93,6 +93,8 @@ import type {
 	Model,
 	ProviderResponseMetadata,
 	ProviderSessionState,
+	RateLimitRotationInfo,
+	RateLimitRotationOptions,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
 	ResetCreditTarget,
@@ -524,6 +526,14 @@ export type AgentSessionEvent =
 			attempt: number;
 			finalError?: string;
 			recoveredErrors?: RecoveredRetryError[];
+	  }
+	| {
+			type: "credential_rotated";
+			provider: string;
+			reason: "rate_limit" | "usage_limit";
+			retryAfterMs?: number;
+			/** Clamped block applied to the hot credential (ms), when known. */
+			blockedForMs?: number;
 	  }
 	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
@@ -6927,6 +6937,49 @@ export class AgentSession {
 	}
 
 	/** Apply session-level stream hooks to a direct side request. */
+	/**
+	 * Build the rotate-on-rate-limit options for a stream call, or `undefined`
+	 * when the feature is disabled. The `hasUsableSibling` capability and the
+	 * `onRotate` telemetry are bound to the credential store + this session so
+	 * pi-ai stays headless. `provider` scopes the sibling check and the emitted
+	 * event; pass the request's model provider.
+	 */
+	#rateLimitRotationOptions(provider: string, sessionId: string | undefined): RateLimitRotationOptions | undefined {
+		const retry = this.settings.getGroup("retry");
+		if (!retry.rotateOnRateLimit) return undefined;
+		const authStorage = this.#modelRegistry.authStorage;
+		return {
+			enabled: true,
+			minSleepMs: retry.rotateMinSleepMs,
+			hasUsableSibling: () => authStorage.hasUsableSibling(provider, sessionId),
+			onRotate: info => this.#onCredentialRotated(info),
+		};
+	}
+
+	/** Surface a credential rotation as a session event + structured log line (plan §7). */
+	#onCredentialRotated(info: RateLimitRotationInfo): void {
+		// N1: the real block is sized privately inside rotateSessionCredential and
+		// never returns here. Recompute the same clamp from retryAfterMs purely for
+		// display; usage-limit blocks use a different (server-derived) window we do
+		// not know, so leave `blockedForMs` unset for them.
+		const blockedForMs =
+			info.reason === "rate_limit" ? Math.min(Math.max(info.retryAfterMs ?? 60_000, 5_000), 120_000) : undefined;
+		logger.info("credential rotated on rate limit", {
+			provider: info.provider,
+			reason: info.reason,
+			retryAfterMs: info.retryAfterMs,
+			attempt: info.attempt,
+			blockedForMs,
+		});
+		this.#emit({
+			type: "credential_rotated",
+			provider: info.provider,
+			reason: info.reason,
+			retryAfterMs: info.retryAfterMs,
+			blockedForMs,
+		});
+	}
+
 	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
 		const sessionOnPayload = this.#onPayload;
 		const sessionOnResponse = this.#onResponse;
@@ -6954,6 +7007,14 @@ export class AgentSession {
 				...options.loopGuard,
 			},
 		};
+
+		// Thread rotate-on-rate-limit onto every direct-call stream (handoff,
+		// side-channel, …) unless the caller already supplied it. Provider-scoped
+		// so the sibling check and rotation event match the request's provider.
+		if (options.rateLimitRotation === undefined) {
+			const rotation = this.#rateLimitRotationOptions(provider, options.sessionId);
+			if (rotation) preparedOptions.rateLimitRotation = rotation;
+		}
 
 		// Stamp session metadata (e.g. user_id={session_id}) onto direct-call requests so
 		// they share the same session bucket as Agent.prompt-routed requests on Anthropic

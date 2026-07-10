@@ -1367,6 +1367,28 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.rotateOnRateLimit": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Rotate On Rate Limit",
+			description:
+				"On a transient per-minute (RPM) 429, fail the request over to a healthy sibling credential instead of waiting out the window. Off by default; needs 2+ credentials for the same provider.",
+		},
+	},
+	"retry.rotateMinSleepMs": {
+		type: "number",
+		default: 2000,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Rotate Min Sleep",
+			description:
+				"Only surface a rate-limited request for credential rotation once the provider's in-loop wait would meet this many ms. Shorter waits are slept off in place.",
+		},
+	},
 	"retry.fallbackChains": {
 		type: "record",
 		default: {} as Record<string, string[]>,
@@ -5092,6 +5114,8 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	rotateOnRateLimit: boolean;
+	rotateMinSleepMs: number;
 }
 
 export interface MemoriesSettings {
