@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { streamSimple } from "@oh-my-pi/pi-ai";
+import { isRotatableRateLimitOutcome } from "@oh-my-pi/pi-ai/error/rate-limit";
 import {
 	getOpenAICodexTransportDetails,
 	getOpenAICodexWebSocketDebugStats,
@@ -15,6 +16,7 @@ import type {
 	ModelSpec,
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
+import { parseRetryAfterMsHint } from "@oh-my-pi/pi-ai/utils/rate-limit-rotation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as piUtils from "@oh-my-pi/pi-utils";
 
@@ -4614,5 +4616,44 @@ describe("openai-codex SSE statelessness", () => {
 			providerSessionState,
 		});
 		expect(stats).toMatchObject({ fullContextRequests: 2, deltaRequests: 0 });
+	});
+});
+
+describe("openai-codex retry-after-ms embedding (B3)", () => {
+	it("embeds the surfaced 429 Retry-After so the a/b/c seam can size a rotation block", async () => {
+		// The EMBED half of plan §9's round-trip: with rotation ON, a transient 429 is
+		// surfaced early (onBeforeSleep → "surface") and the server Retry-After is
+		// appended as `; retry-after-ms: <N>` to the terminal error message, which A4
+		// later reads back via parseRetryAfterMsHint to size the short block.
+		const tempDir = TempDir.createSync("@pi-codex-rl-embed-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const fetchMock: FetchImpl = (async () =>
+			new Response(JSON.stringify({ error: { code: "rate_limit_exceeded", message: "slow down" } }), {
+				status: 429,
+				headers: { "content-type": "application/json", "retry-after-ms": "8000" },
+			})) as FetchImpl;
+
+		let message: string | undefined;
+		let status: number | undefined;
+		try {
+			const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+				apiKey: token,
+				fetch: fetchMock,
+				rateLimitRotation: { enabled: true, minSleepMs: 2_000, hasUsableSibling: () => true },
+			}).result();
+			message = result.errorMessage;
+			status = result.errorStatus;
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+			status = (err as { status?: number })?.status;
+		}
+
+		expect(status).toBe(429);
+		// Round-trips to the exact server value.
+		expect(parseRetryAfterMsHint(message)).toBe(8_000);
+		// Stays classifiable as a rotatable rate limit (never usage-limit).
+		expect(isRotatableRateLimitOutcome(429, message)).toBe(true);
 	});
 });

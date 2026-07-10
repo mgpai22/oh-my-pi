@@ -184,4 +184,19 @@ describe("makeRotationAwareOnBeforeSleep", () => {
 			}),
 		).toBe("sleep");
 	});
+
+	it("emits a rate_limit_stall WARN on an un-rotated 429 sleep ≥10s", () => {
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const decide = makeRotationAwareOnBeforeSleep({
+				provider: "openai",
+				rotation: rotation({ hasUsableSibling: () => false }),
+			});
+			expect(decide({ attempt: 3, delayMs: 12_000, status: 429 })).toBe("sleep");
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0]?.[0]).toBe("rate_limit_stall");
+		} finally {
+			warn.mockRestore();
+		}
+	});
 });

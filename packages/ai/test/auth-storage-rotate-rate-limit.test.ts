@@ -40,19 +40,27 @@ describe("AuthStorage rotate-on-rate-limit branch (A4)", () => {
 		}
 	});
 
-	async function storageWith(count: number): Promise<{ storage: AuthStorage; ids: number[] }> {
+	async function storageWith(
+		count: number,
+	): Promise<{ storage: AuthStorage; ids: number[]; store: SqliteAuthCredentialStore }> {
 		const store = await SqliteAuthCredentialStore.open(dbPath);
 		for (let i = 0; i < count; i++) store.saveOAuth(PROVIDER, oauthCredential(String(i)));
 		const storage = new AuthStorage(store);
 		await storage.reload();
 		const ids = store.listAuthCredentials(PROVIDER).map(row => row.id);
-		return { storage, ids };
+		return { storage, ids, store };
 	}
 
-	it("short-blocks the hot credential (unscoped, sized to retry-after-ms) and re-ranks onto a sibling", async () => {
-		const { storage, ids } = await storageWith(2);
+	const stickyKey = `session:sticky:${PROVIDER}:${SESSION}`;
+
+	it("short-blocks the hot credential (unscoped, sized to retry-after-ms), leaves sticky intact, and re-ranks onto a sibling", async () => {
+		const { storage, ids, store } = await storageWith(2);
 		try {
 			const before = await storage.getApiKey(PROVIDER, SESSION);
+			// The initial resolve pinned a session-sticky credential.
+			const stickyBefore = store.getCache(stickyKey);
+			expect(stickyBefore).not.toBeNull();
+
 			const now = Date.now();
 			const switched = await storage.rotateSessionCredential(PROVIDER, SESSION, { error: rateLimitError(37_000) });
 			expect(switched).toBe(true);
@@ -64,7 +72,14 @@ describe("AuthStorage rotate-on-rate-limit branch (A4)", () => {
 			expect(blocks[0]!.blockedUntilMs - now).toBeGreaterThanOrEqual(36_000);
 			expect(blocks[0]!.blockedUntilMs - now).toBeLessThanOrEqual(38_000);
 
-			// Serial-agent equivalence: the next resolve re-ranks onto the sibling.
+			// STICKY INTACT (plan §5 A4 / P1-3): the rotation branch must NOT clear the
+			// session-sticky credential — the v1 bug did exactly that, silently un-pinning
+			// the session. Blocking + re-ranking (not clearing) does the rotation, so the
+			// sticky pointer is byte-identical after rotation.
+			expect(store.getCache(stickyKey)).toBe(stickyBefore);
+
+			// Serial-agent equivalence: the next resolve re-ranks around the block onto
+			// the sibling (distinct API key).
 			const after = await storage.getApiKey(PROVIDER, SESSION);
 			expect(after).not.toBe(before);
 		} finally {
@@ -79,6 +94,42 @@ describe("AuthStorage rotate-on-rate-limit branch (A4)", () => {
 			const switched = await storage.rotateSessionCredential(PROVIDER, SESSION, { error: rateLimitError(37_000) });
 			expect(switched).toBe(false);
 			expect(storage.listCredentialBlocks(ids).filter(b => b.blockedUntilMs > Date.now())).toEqual([]);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("all-blocked → returns false and resolves least-bad fallback identical to baseline (no new block)", async () => {
+		// Distinct from the single-credential case (no sibling EXISTS): here a sibling
+		// exists but is already blocked, so #hasUsableSibling finds no USABLE sibling.
+		const { storage, ids } = await storageWith(2);
+		try {
+			await storage.getApiKey(PROVIDER, SESSION);
+
+			// First rotatable 429 blocks the hot credential and rotates onto the sibling.
+			expect(await storage.rotateSessionCredential(PROVIDER, SESSION, { error: rateLimitError(60_000) })).toBe(true);
+			// Re-resolve pins the session onto the now-sole-usable sibling.
+			const siblingKey = await storage.getApiKey(PROVIDER, SESSION);
+			const firstBlocks = storage.listCredentialBlocks(ids).filter(b => b.blockedUntilMs > Date.now());
+			expect(firstBlocks).toHaveLength(1);
+			const blockedId = firstBlocks[0]!.credentialId;
+
+			// Baseline resolution BEFORE the second (doomed) rotation attempt.
+			const baseline = await storage.getApiKey(PROVIDER, SESSION);
+			expect(baseline).toBe(siblingKey);
+
+			// Second rotatable 429 now finds NO usable sibling (the original credential is
+			// still blocked) → returns false and adds no new block on the hot credential.
+			expect(await storage.rotateSessionCredential(PROVIDER, SESSION, { error: rateLimitError(60_000) })).toBe(
+				false,
+			);
+
+			const secondBlocks = storage.listCredentialBlocks(ids).filter(b => b.blockedUntilMs > Date.now());
+			expect(secondBlocks).toHaveLength(1);
+			expect(secondBlocks[0]!.credentialId).toBe(blockedId); // same single block, none added
+
+			// Resolution proceeds identically to the pre-attempt baseline (least-bad fallback).
+			expect(await storage.getApiKey(PROVIDER, SESSION)).toBe(baseline);
 		} finally {
 			storage.close();
 		}
