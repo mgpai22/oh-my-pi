@@ -144,6 +144,58 @@ export function isUsageLimitOutcome(status: number | undefined, message: string 
 }
 
 /**
+ * Returns true for the ONE transient rate-limit class this feature rotates on:
+ * a per-minute RPM window (`parseRateLimitReason` → `RATE_LIMIT_EXCEEDED`).
+ * MODEL_CAPACITY (529/overloaded/503), QUOTA (account cap), SERVER_ERROR, and
+ * UNKNOWN are all excluded — a provider-wide incident must not thrash siblings,
+ * and account caps take the existing usage-limit long-block path.
+ *
+ * Deliberately message-only: `parseRateLimitReason` prioritizes quota/capacity
+ * phrasing above the rate-limit phrase, so a message that also reads as a usage
+ * cap never classifies here. This keeps {@link isRotatableRateLimitOutcome}
+ * disjoint from {@link isUsageLimitOutcome} for the rotation-marker string
+ * (§9 contract pin). `status` is accepted for call-site symmetry with
+ * {@link isUsageLimitOutcome} but the decision is driven entirely by `message`.
+ */
+export function isRotatableRateLimitOutcome(status: number | undefined, message: string | undefined): boolean {
+	void status;
+	if (!message) return false;
+	return parseRateLimitReason(message) === "RATE_LIMIT_EXCEEDED";
+}
+
+/**
+ * Error-object convenience mirroring {@link import("./flags").isUsageLimit}: the
+ * a/b/c auth-retry driver (`auth-retry.ts`) hands us an error value with no
+ * pre-extracted status/message, so pull the message off the error and defer to
+ * {@link isRotatableRateLimitOutcome} (which is message-driven anyway).
+ */
+export function isRotatableRateLimit(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
+	return isRotatableRateLimitOutcome(undefined, message);
+}
+
+/**
+ * Control-flow marker thrown from the Anthropic transport's provider-retry wait
+ * hook when a transient RPM 429 should surface for sibling rotation instead of
+ * being slept off in-loop. Lives here — a dependency-light leaf module imported
+ * by both `providers/anthropic.ts` and `utils/rate-limit-rotation.ts` — so the
+ * rotation factory can import scheduler/classifier without dragging
+ * `stream.ts`/`auth-storage.ts` into an `anthropic → rotation → providers`
+ * import cycle (see plan N2). The Anthropic outer catch converts the throw into
+ * a terminal `{type:"error"}` event; the marker is never observed as a thrown
+ * exception by the a/b/c seam under normal operation.
+ */
+export class RateLimitRotationRequested extends Error {
+	readonly status = 429;
+	readonly retryAfterMs: number | undefined;
+	constructor(options?: { retryAfterMs?: number; cause?: unknown }) {
+		super("rate limit exceeded (rotation requested)", { cause: options?.cause });
+		this.name = "RateLimitRotationRequested";
+		this.retryAfterMs = options?.retryAfterMs;
+	}
+}
+
+/**
  * A 429 body is opaque when it carries no signal beyond the status itself —
  * empty, whitespace-only, the status digits with HTTP/JSON framing, or
  * generic punctuation. Anything else (retry hints, capacity wording, error

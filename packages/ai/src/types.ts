@@ -347,6 +347,43 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
 	operationId: string;
 }
 
+/** Reason a rotation fired, surfaced to {@link RateLimitRotationOptions.onRotate}. */
+export type RateLimitRotationReason = "rate_limit" | "usage_limit";
+
+/** Payload handed to {@link RateLimitRotationOptions.onRotate} when a rotation happens. */
+export interface RateLimitRotationInfo {
+	provider: string;
+	reason: RateLimitRotationReason;
+	/** Server retry hint (ms) parsed off the rotating error, when present. */
+	retryAfterMs?: number;
+	/** a/b/c step index at which the rotation occurred (0-based). */
+	attempt: number;
+}
+
+/**
+ * Rotate-on-rate-limit configuration threaded onto {@link StreamOptions}.
+ * Built by the host (which owns the credential store) so pi-ai stays headless:
+ * the sibling-availability capability and the rotation callback are supplied by
+ * the caller rather than pi-ai reaching into an auth store or an event bus.
+ */
+export interface RateLimitRotationOptions {
+	/** Master switch. When false the feature is inert (byte-identical legacy path). */
+	enabled: boolean;
+	/**
+	 * Minimum in-loop provider wait (ms) that must be exceeded before a transient
+	 * 429 is surfaced early for rotation. Short waits are slept off normally.
+	 */
+	minSleepMs: number;
+	/**
+	 * Capability check: does a usable sibling credential exist for this request's
+	 * provider/session right now? Absent ⇒ the feature is inert (R4) — a
+	 * non-AuthStorage resolver cannot rotate, so we never surface early for it.
+	 */
+	hasUsableSibling?: () => boolean;
+	/** Fired inside the a/b/c loop when a rotation actually happens. */
+	onRotate?: (info: RateLimitRotationInfo) => void;
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -497,9 +534,23 @@ export interface StreamOptions {
 	 */
 	streamIdleTimeoutMs?: number;
 	/**
-	 * Optional retry delay hook for tests and transports that need custom scheduling.
+	 * Optional retry delay hook for tests and transports that need custom
+	 * scheduling. `cause` carries the pending provider error the wait is backing
+	 * off from (an {@link AnthropicApiError}-shaped 429/529, or `undefined` for a
+	 * benign empty-completion re-request), so a rotation-aware wait can classify
+	 * it and surface transient RPM 429s for sibling rotation instead of sleeping.
 	 */
-	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	providerRetryWait?: (delayMs: number, signal?: AbortSignal, cause?: unknown) => Promise<void>;
+	/**
+	 * Sibling-credential failover for transient per-minute (RPM) 429s. When
+	 * `enabled` and a usable sibling exists, the streaming a/b/c seam admits a
+	 * `RATE_LIMIT_EXCEEDED` 429 for rotation (instead of leaving it in the
+	 * provider's own backoff loop) and providers surface such a 429 early — once
+	 * the in-loop wait would exceed `minSleepMs` — rather than sleeping it off.
+	 * Absent, disabled, or without a `hasUsableSibling` capability ⇒ byte-identical
+	 * legacy behavior (feature inert). See plan §4-§7.
+	 */
+	rateLimitRotation?: RateLimitRotationOptions;
 	/**
 	 * Optional `fetch` implementation override. Providers route every HTTP
 	 * request — direct calls, SDK clients, and retry helpers — through this
