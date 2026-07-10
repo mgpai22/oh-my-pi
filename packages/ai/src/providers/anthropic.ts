@@ -18,6 +18,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
+import { RateLimitRotationRequested } from "../error/rate-limit";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
 	AnthropicFallbackContent,
@@ -58,6 +59,7 @@ import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { formatRateLimitRotationMessage, makeRotationAwareRetryWait } from "../utils/rate-limit-rotation";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { spillToDescription } from "../utils/schema/spill";
 import { createSdkStreamRequestOptions } from "../utils/sdk-stream-timeout";
@@ -1948,6 +1950,15 @@ const streamAnthropicOnce = (
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
+			// Resolve the retry-wait hook ONCE so a rotation-aware wait keeps its
+			// internal stall-attempt counter across retries. An explicit caller
+			// `providerRetryWait` (test/transport seam) wins; otherwise a rotation
+			// config builds the marker-throwing wait.
+			const retryWaitHook =
+				options?.providerRetryWait ??
+				(options?.rateLimitRotation
+					? makeRotationAwareRetryWait({ provider: model.provider, rotation: options.rateLimitRotation })
+					: undefined);
 			const firstEventTimeoutAbortError = new AIError.StreamTimeoutError(
 				"Anthropic stream timed out while waiting for the first event",
 			);
@@ -2533,8 +2544,8 @@ const streamAnthropicOnce = (
 							? retryDelayFromHeaders(streamFailure.headers)
 							: undefined;
 					const delayMs = headerDelayMs !== undefined ? Math.max(headerDelayMs, backoffDelayMs) : backoffDelayMs;
-					if (options?.providerRetryWait) {
-						await options.providerRetryWait(delayMs, options.signal);
+					if (retryWaitHook) {
+						await retryWaitHook(delayMs, options?.signal, streamFailure);
 					} else {
 						await scheduler.wait(delayMs, { signal: options?.signal });
 					}
@@ -2562,6 +2573,22 @@ const streamAnthropicOnce = (
 		} catch (error) {
 			for (const block of output.content) {
 				if (block.type === "toolCall") clearStreamingPartialJson(block);
+			}
+			// The rotation-aware retry wait throws this marker to break a transient
+			// RPM 429 out of the in-loop sleep. Convert it into a terminal 429 error
+			// whose message is RATE_LIMIT_EXCEEDED-classifiable AND carries the
+			// `retry-after-ms:` hint, so the streaming a/b/c seam admits it for
+			// rotation (A2) and the auth-storage branch (A4) can size the block.
+			if (error instanceof RateLimitRotationRequested) {
+				output.stopReason = "error";
+				output.errorStatus = 429;
+				output.errorId = undefined;
+				output.errorMessage = formatRateLimitRotationMessage(error.retryAfterMs ?? 0);
+				output.duration = performance.now() - startTime;
+				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+				stream.push({ type: "error", reason: output.stopReason, error: output });
+				stream.end();
+				return;
 			}
 			const result = await AIError.finalize(error, {
 				api: model.api,

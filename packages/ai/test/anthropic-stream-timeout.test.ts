@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { RateLimitRotationRequested } from "@oh-my-pi/pi-ai/error/rate-limit";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { AnthropicMessagesClientLike } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
@@ -456,7 +457,9 @@ describe("anthropic provider retry delays", () => {
 
 		// Header says 30s; the 2s exponential backoff must not undercut it.
 		expect(attempt).toBe(2);
-		expect(providerRetryWait).toHaveBeenCalledWith(30_000, undefined);
+		// B1: the retry-wait hook now also receives the pending provider error as
+		// `cause` (here the 529 overloaded error) so a rotation-aware wait can classify it.
+		expect(providerRetryWait).toHaveBeenCalledWith(30_000, undefined, expect.any(Error));
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "after backoff" }]);
 	});
@@ -531,5 +534,38 @@ describe("anthropic provider retry delays", () => {
 		]);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered from 502" }]);
+	});
+});
+
+describe("anthropic rotation marker surfacing (Prong B contract)", () => {
+	it("converts a thrown RateLimitRotationRequested into a terminal 429 error EVENT, not a throw", async () => {
+		// Every attempt hangs before the first event so the first-event watchdog
+		// drives the retry path; the retry-wait hook throws the rotation marker.
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) =>
+			createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				events: undefined,
+			}) as never) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+
+		const stream = streamAnthropic(model, context, {
+			client,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait: async () => {
+				throw new RateLimitRotationRequested({ retryAfterMs: 5000 });
+			},
+		});
+
+		const events: Array<{ type: string; error?: { errorStatus?: number; errorMessage?: string } }> = [];
+		for await (const event of stream) {
+			events.push(event as { type: string; error?: { errorStatus?: number; errorMessage?: string } });
+		}
+
+		const errorEvent = events.find(event => event.type === "error");
+		expect(errorEvent).toBeDefined();
+		expect(errorEvent?.error?.errorStatus).toBe(429);
+		// Rate-limit-classifiable AND carrying the retry-after hint (A2 admission + A4 sizing).
+		expect(errorEvent?.error?.errorMessage).toMatch(/rate limit exceeded/i);
+		expect(errorEvent?.error?.errorMessage).toContain("retry-after-ms: 5000");
 	});
 });
