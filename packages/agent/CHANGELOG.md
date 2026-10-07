@@ -13,6 +13,9 @@
 ### Changed
 
 - Improved performance when pruning tool output and capturing telemetry messages during long-running sessions.
+### Added
+
+- Added `AgentLoopConfig.hasQueuedAsides` (also on `Agent`), a non-consuming peek that lets a queued aside end a running interruptible `wait` without signaling other tools ([#14731](https://github.com/can1357/oh-my-pi/pull/14731) by [@mgpai22](https://github.com/mgpai22))
 
 ## [18.7.0] - 2026-10-06
 
