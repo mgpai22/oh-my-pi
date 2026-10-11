@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Anthropic on-demand compaction now works through a custom gateway, on the Anthropic facade or over `transport: pi-native`, when the model sets `compat.supportsServerCompaction: true` and `remoteCompaction.enabled: true`; it applies only at the model's own `baseUrl`
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes

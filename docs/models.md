@@ -898,7 +898,9 @@ For `anthropic-messages` models the runtime uses a separate `AnthropicCompat` sh
 top-level provider field; inside `compat` it honors every shared key that also names an
 `AnthropicCompat` field: `supportsContextManagement`, `supportsEagerToolInputStreaming`,
 `supportsForcedToolChoice`, `allowAnthropicHeaderOverrides`, `requiresToolResultId`,
-`replayUnsignedThinking`, `bedrockMessagesApi`, `stripImageInput`, and `streamIdleTimeoutMs`. Other Anthropic-side knobs
+`replayUnsignedThinking`, `bedrockMessagesApi`, `supportsServerCompaction`, `stripImageInput`, and `streamIdleTimeoutMs`. Set
+`supportsServerCompaction: true` together with `remoteCompaction.enabled: true` on a custom Anthropic gateway model to
+let it use Anthropic on-demand compaction at its own `baseUrl` (see [compaction](./compaction.md)). Other Anthropic-side knobs
 are supplied by built-in catalog metadata and are not configurable here — `applyCompatOverrides`
 drops override keys the resolved shape does not declare.
 
