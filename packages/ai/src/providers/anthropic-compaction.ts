@@ -31,35 +31,35 @@ export function resolvesToOfficialAnthropicEndpoint(model: Model<"anthropic-mess
 	return isOfficialAnthropicApiUrl(baseUrl);
 }
 
-/** Whether model policy and the effective deployment support on-demand compaction. */
+/**
+ * Whether model policy and the effective deployment support on-demand compaction.
+ * A route outside the known deployments, such as a custom gateway or proxy,
+ * qualifies only when its model declares the capability and opts in with
+ * `remoteCompaction.enabled`, and only on the model's own configured endpoint.
+ */
 export function supportsAnthropicCompaction(model: Model<"anthropic-messages">, effectiveBaseUrl?: string): boolean {
 	if (!isCompactionCapableModel(model)) return false;
+	const ownRoute = normalizeAnthropicBaseUrl(model.baseUrl);
+	const effective = effectiveBaseUrl === undefined ? undefined : normalizeAnthropicBaseUrl(effectiveBaseUrl);
+	const optedIn = model.remoteCompaction?.enabled === true;
 	if (
 		model.transport === "pi-native" &&
-		model.compat.firstPartyProvider === true &&
-		(effectiveBaseUrl === undefined || effectiveBaseUrl === normalizeAnthropicBaseUrl(model.baseUrl))
+		(model.compat.firstPartyProvider === true || optedIn) &&
+		(effective === undefined || effective === ownRoute)
 	) {
 		return true;
 	}
-	const route =
-		effectiveBaseUrl ??
-		(model.provider === "anthropic"
-			? resolveDirectAnthropicBaseUrl(model)
-			: normalizeAnthropicBaseUrl(model.baseUrl));
+	const route = effective ?? (model.provider === "anthropic" ? resolveDirectAnthropicBaseUrl(model) : ownRoute);
 	// Bedrock's Anthropic Messages API implements on-demand compaction. The flag is detected
 	// from a Bedrock `/anthropic` baseUrl, or set in models.yml for a proxy or a reroute; it
 	// applies to the model's own endpoint or a Bedrock `/anthropic` route it reaches.
-	if (
-		model.compat.bedrockMessagesApi === true &&
-		(isBedrockAnthropicRoute(route) || route === normalizeAnthropicBaseUrl(model.baseUrl))
-	) {
+	if (model.compat.bedrockMessagesApi === true && (isBedrockAnthropicRoute(route) || route === ownRoute)) {
 		return true;
 	}
+	if (optedIn && route === ownRoute) return true;
 	return (
 		isSupportedCompactionEndpoint(route) &&
-		(model.compat.firstPartyProvider === true ||
-			model.provider === "google-vertex" ||
-			model.remoteCompaction?.enabled === true)
+		(model.compat.firstPartyProvider === true || model.provider === "google-vertex" || optedIn)
 	);
 }
 

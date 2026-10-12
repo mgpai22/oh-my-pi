@@ -304,6 +304,77 @@ describe("Anthropic on-demand compaction requests", () => {
 		});
 		expect(supportsAnthropicCompaction(optedOut)).toBe(false);
 	});
+
+	describe("custom gateway opt-in", () => {
+		const facade = { ...spec, provider: "life-os", baseUrl: "http://127.0.0.1:8788/anthropic" };
+		const capable = { supportsServerCompaction: true };
+		const optedIn = buildModel({ ...facade, compat: capable, remoteCompaction: { enabled: true } });
+		const tool: NonNullable<Context["tools"]>[number] = {
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+		};
+
+		it("sends on-demand compaction to the gateway's own endpoint with the declared capability and the opt-in", async () => {
+			const response = await captureRequest(optedIn, { anthropicCompaction: { instructions: "Summarize." } });
+			expect(response.payload.compaction).toEqual({ type: "summarize", instructions: "Summarize." });
+			expect(response.beta).toContain("compact-2026-09-04");
+			// The opt-in covers the configured endpoint only, never a different effective route.
+			expect(supportsAnthropicCompaction(optedIn, "https://other-gateway.example/anthropic")).toBe(false);
+		});
+
+		it("replays the gateway opt-in through a caller-owned SDK client with a normalized endpoint", async () => {
+			for (const suffix of ["/", "/v1"]) {
+				const response = await captureInjected(optedIn, `${facade.baseUrl}${suffix}`, { anthropicCompaction: {} });
+				expect(response.payload.compaction).toEqual({ type: "summarize" });
+				expect(response.beta).toContain("compact-2026-09-04");
+			}
+			const rerouted = await captureInjected(optedIn, "https://other-gateway.example/anthropic/v1", {
+				anthropicCompaction: {},
+			});
+			expect(rerouted.payload.compaction).toBeUndefined();
+			expect(rerouted.beta).not.toContain("compact-2026-09-04");
+		});
+
+		it("keeps compaction off without the opt-in, without the capability, or with an explicit disable", async () => {
+			const blocked = [
+				buildModel({ ...facade, compat: capable }),
+				buildModel({ ...facade, remoteCompaction: { enabled: true } }),
+				buildModel({ ...facade, compat: capable, remoteCompaction: { enabled: false } }),
+			];
+			for (const requestModel of blocked) {
+				const response = await captureRequest(requestModel, { anthropicCompaction: {} });
+				expect(response.payload.compaction).toBeUndefined();
+				expect(response.beta).not.toContain("compact-2026-09-04");
+			}
+		});
+
+		it("gates a pi-native gateway the same way", () => {
+			const piNative = { ...facade, baseUrl: "http://127.0.0.1:8788", transport: "pi-native" as const };
+			expect(
+				supportsAnthropicCompaction(
+					buildModel({ ...piNative, compat: capable, remoteCompaction: { enabled: true } }),
+				),
+			).toBe(true);
+			expect(supportsAnthropicCompaction(buildModel({ ...piNative, compat: capable }))).toBe(false);
+			expect(
+				supportsAnthropicCompaction(
+					buildModel({ ...piNative, compat: capable, remoteCompaction: { enabled: false } }),
+				),
+			).toBe(false);
+		});
+
+		it("leaves a normal turn's tools, metadata and betas unchanged", async () => {
+			const baseline = buildModel({ ...facade, compat: capable });
+			const options = { sessionId: "conversation", metadata: { user_id: "user-1" } };
+			const before = await captureRequest(baseline, options, context.messages, [tool]);
+			const after = await captureRequest(optedIn, options, context.messages, [tool]);
+			expect(after.payload.tools).toEqual(before.payload.tools);
+			expect(after.payload.metadata).toEqual(before.payload.metadata);
+			expect(after.payload.compaction).toBeUndefined();
+			expect(after.beta).toBe(before.beta);
+		});
+	});
 });
 
 describe("Anthropic on-demand compaction response", () => {

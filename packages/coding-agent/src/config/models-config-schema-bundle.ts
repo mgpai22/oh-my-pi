@@ -85,6 +85,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"requiresToolResultId?": "boolean",
 		"replayUnsignedThinking?": "boolean",
 		"bedrockMessagesApi?": "boolean",
+		"supportsServerCompaction?": "boolean",
 	} as const;
 
 	const OpenAICompatFieldsSchema = type(OpenAICompatFields);

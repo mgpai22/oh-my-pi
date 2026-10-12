@@ -5,6 +5,7 @@
 ### Added
 
 - Added hiding a pending `ask` question without answering it: `Alt+H` (`app.ask.hide`) or the Hide button in Tern collapses the dialog to one line; the same key, `Enter`, or Show brings it back ([#15400](https://github.com/can1357/oh-my-pi/pull/15400) by [@H4vC](https://github.com/H4vC))
+- Added `compat.supportsServerCompaction` to `models.yml`: with `remoteCompaction.enabled: true`, a custom Anthropic gateway model now uses remote compaction instead of silently falling back to a local summary
 
 ## [18.9.2] - 2026-10-11
 
